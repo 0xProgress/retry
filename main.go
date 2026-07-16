@@ -1,8 +1,9 @@
 package main
 
 import (
-	"io"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -10,9 +11,17 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+var (
+	errHelp    = errors.New("help")
+	errVersion = errors.New("version")
+)
+
+const version = "1.0.1"
 
 const (
 	ExitSuccess        = 0
@@ -44,7 +53,10 @@ func (c Config) UseColor() bool {
 	if c.NoColor {
 		return false
 	}
-	fileInfo, _ := os.Stderr.Stat()
+	fileInfo, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
 	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
@@ -119,11 +131,14 @@ func parseArgs() (*Config, error) {
 		case "-v", "--verbose":
 			cfg.Verbose = true
 
+		case "--version":
+			return nil, errVersion
+
 		case "--no-color":
 			cfg.NoColor = true
 
 		case "-h", "--help":
-			return nil, fmt.Errorf("help")
+			return nil, errHelp
 
 		default:
 			if strings.HasPrefix(args[i], "-") {
@@ -185,7 +200,7 @@ func run(cfg *Config) int {
 
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		
+
 		startTime := time.Now()
 		err := cmd.Start()
 		if err != nil {
@@ -195,9 +210,11 @@ func run(cfg *Config) int {
 			return ExitCommandNotFound
 		}
 
+		var interrupted atomic.Bool
 		go func() {
 			for sig := range sigCh {
-				cmd.Process.Signal(sig)
+				interrupted.Store(true)
+				_ = cmd.Process.Signal(sig)
 			}
 		}()
 
@@ -217,8 +234,19 @@ func run(cfg *Config) int {
 		exitCode := ExitFailure
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				exitCode = status.ExitStatus()
+				if status.Signaled() {
+					exitCode = 128 + int(status.Signal())
+				} else {
+					exitCode = status.ExitStatus()
+				}
 			}
+		}
+
+		if interrupted.Load() {
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "%s✗%s interrupted\n", red, reset)
+			}
+			return exitCode
 		}
 
 		if cfg.RetryIf != nil {
@@ -262,6 +290,7 @@ Options:
       --retry-if RE   Only retry when stderr matches regex pattern
   -v, --verbose       Print attempt count and backoff details
       --no-color      Disable colored output
+      --version       Print version
   -h, --help          Show this help message
 
 Backoff strategies:
@@ -288,8 +317,12 @@ https://github.com/0xProgress/retry
 func main() {
 	cfg, err := parseArgs()
 	if err != nil {
-		if err.Error() == "help" {
+		if errors.Is(err, errHelp) {
 			fmt.Print(helpText)
+			os.Exit(ExitSuccess)
+		}
+		if errors.Is(err, errVersion) {
+			fmt.Println("retry version", version)
 			os.Exit(ExitSuccess)
 		}
 		fmt.Fprintf(os.Stderr, "retry: %v\n", err)
